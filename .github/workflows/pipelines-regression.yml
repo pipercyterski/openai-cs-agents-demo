@@ -1,0 +1,42 @@
+name: Dystopic regression
+
+on:
+  pull_request:
+    # ready_for_review is NOT a default event type — without it, a check that
+    # skipped while the PR was a draft hangs "expected" forever after the PR
+    # flips to ready.
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Gate pushes to main in head-only (absolute gate) mode:
+  # push:
+  #   branches: [main]
+
+permissions:
+  contents: read
+  checks: write
+  # For the sticky PR comment with the per-seed regression report. Omitting
+  # it doesn't fail the check — the comment is just silently skipped.
+  pull-requests: write
+
+concurrency:
+  group: pipelines-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Both the PR's merge-base and head commits must be present.
+          fetch-depth: 0
+      - uses: BuildPipelines/pipelines-regression-action@v1
+        with:
+          api-key: ${{ secrets.DYSTOPIC_API_KEY }}
+          # Nothing else is configured here. The platform sources the agent's
+          # bound CI suite's frozen scenarios and resolves the run recipe
+          # (command, tools, credentials) from this repo's connected umbrella
+          # agent — there is no local project file to read.
+          #
+          # Optional: name a specific platform suite. Defaults to the agent's
+          # bound CI suite (`dystopic agents ci-suite set`), else "default".
+          # suite: my-suite
