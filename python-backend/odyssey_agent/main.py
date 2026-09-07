@@ -12,8 +12,8 @@ Multi-agent instrumentation wired here:
   transfer (the graded lane the reconstructed graph unions), AND emits a
   ``handoff_traversal`` telemetry span beside it (the display-only rationale
   lane) — deliberately exercising both multi-agent channels in one run.
-* A ``note`` span marks dispatch start; a ``state_snapshot`` span records the
-  port's final itinerary state.
+* A ``state_snapshot`` span records the port's final itinerary state when the
+  turn hydrated anything (all-null snapshots are skipped as trace clutter).
 * Per-call actor attribution is done by the tools themselves
   (``dystopic_function_tool`` in ``airline.py``) — the hooks only keep the
   ambient label fresh and emit edges.
@@ -215,15 +215,6 @@ def run(task_input: dict, *, proxy_url: str, run_token: str) -> dict:
     agent = build_root_agent()
 
     async def _run():
-        await async_safe_emit(
-            "note",
-            {
-                "text": (
-                    "dispatch start: "
-                    + ("multi-turn transcript" if isinstance(instruction, list) else "single-shot")
-                )
-            },
-        )
         result = await Runner.run(
             agent,
             instruction,
@@ -231,20 +222,20 @@ def run(task_input: dict, *, proxy_url: str, run_token: str) -> dict:
             hooks=_DemoRunHooks(),
             max_turns=MAX_TURNS,
         )
-        await async_safe_emit(
-            "state_snapshot",
-            {
-                "snapshot": {
-                    "passenger_name": state.passenger_name,
-                    "confirmation_number": state.confirmation_number,
-                    "seat_number": state.seat_number,
-                    "flight_number": state.flight_number,
-                    "compensation_case_id": state.compensation_case_id,
-                    "special_service_note": state.special_service_note,
-                },
-                "label": "final-itinerary",
-            },
-        )
+        # Snapshot only when the turn actually hydrated something — an all-null
+        # snapshot on every turn of a refusal conversation is trace clutter.
+        snapshot = {
+            "passenger_name": state.passenger_name,
+            "confirmation_number": state.confirmation_number,
+            "seat_number": state.seat_number,
+            "flight_number": state.flight_number,
+            "compensation_case_id": state.compensation_case_id,
+            "special_service_note": state.special_service_note,
+        }
+        if any(v for v in snapshot.values()):
+            await async_safe_emit(
+                "state_snapshot", {"snapshot": snapshot, "label": "final-itinerary"}
+            )
         return result
 
     try:
@@ -280,9 +271,19 @@ def run(task_input: dict, *, proxy_url: str, run_token: str) -> dict:
     # with typed items (``function_call`` / ``function_call_output``) that carry
     # no ``role`` — convert those to the wire contract's assistant-tool_calls /
     # tool-row shapes so the rich trace shows the tool activity too.
+    #
+    # Return ONLY THIS TURN's work. ``to_input_list()`` is input + new items;
+    # on a replayed multi-turn dispatch the input is the prior conversation,
+    # which the platform already owns — and because our replay conversion
+    # reshapes those rows, echoing them would defeat the platform's
+    # leading-echo trim and duplicate the history inside every turn's
+    # trajectory. Slice the input off before converting.
     messages = None
     try:
-        messages = _to_wire_messages(result.to_input_list()) or None
+        items = result.to_input_list()
+        if isinstance(instruction, list):
+            items = items[len(instruction):]
+        messages = _to_wire_messages(items) or None
     except Exception:
         messages = None
 
