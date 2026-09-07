@@ -104,6 +104,34 @@ def run_async_in_thread(coro_factory, envelope: Envelope):
     return out["result"]
 
 
+def _replay_to_input_items(rows: list) -> list:
+    """Convert a platform-replayed wire transcript into Agents SDK input items.
+
+    Under ``memory_mode: replay`` the platform hands back the *wire-contract*
+    transcript: flat rows that may carry ``tool_calls``, ``role: tool`` results,
+    or ``content: null``. The OpenAI Responses API rejects those shapes verbatim
+    (400 ``Invalid type for 'input[N].content' ... got null``), so keep the
+    conversational spine — user/assistant/system rows with real text — and drop
+    prior-turn tool plumbing (the assistant's own text already narrates it).
+    """
+    items = []
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, list):
+            texts = [
+                p.get("text")
+                for p in content
+                if isinstance(p, dict) and isinstance(p.get("text"), str)
+            ]
+            content = "\n".join(t for t in texts if t)
+        if role in ("user", "assistant", "system") and isinstance(content, str) and content.strip():
+            items.append({"role": role, "content": content})
+    return items
+
+
 def _instruction_from(task_input: dict) -> Any:
     """Extract the agent input from the scenario payload.
 
@@ -115,7 +143,9 @@ def _instruction_from(task_input: dict) -> Any:
     for key in ("messages", "input_items", "conversation"):
         val = task_input.get(key)
         if isinstance(val, list) and val:
-            return val
+            items = _replay_to_input_items(val)
+            if items:
+                return items
     return task_input.get("user_instruction") or json.dumps(task_input)
 
 
