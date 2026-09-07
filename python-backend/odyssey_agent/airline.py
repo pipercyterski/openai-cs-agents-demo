@@ -3,8 +3,15 @@
 This is a faithful re-wrap of ``python-backend/airline`` (the OpenAI Agents SDK
 customer-service example) so it runs headless inside a Dystopic sandbox:
 
-* every tool routes through the Odyssey proxy (:mod:`odyssey_agent.proxy`) so the
-  **simulated world** answers it — the customer's real backend is never touched;
+* every tool routes through the Odyssey proxy via the ``dystopic[odyssey]`` SDK
+  (``async_proxy_call``) so the **simulated world** answers it — the customer's
+  real backend is never touched;
+* every tool call is attributed to the sub-agent that issued it: the tools are
+  built with ``dystopic_function_tool``, which stamps ``X-Pipelines-Actor-Id``
+  at the tool boundary (the only attribution channel that survives the Agents
+  SDK's task-boundary context copies);
+* the two input guardrails emit ``guardrail_decision`` telemetry spans so the
+  trace shows *why* a request was allowed or refused;
 * the ChatKit streaming layer is removed (no UI in a regression run);
 * the model is provider-agnostic: OpenAI when ``OPENAI_API_KEY`` is present,
   otherwise Anthropic via LiteLLM (the org ships an ``ANTHROPIC_API_KEY``).
@@ -26,18 +33,43 @@ from agents import (
     RunContextWrapper,
     Runner,
     TResponseInputItem,
-    function_tool,
-    handoff,
     input_guardrail,
     set_tracing_disabled,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from pydantic import BaseModel
 
-from proxy import proxy_call
+from dystopic.odyssey import ProxyCallError, async_proxy_call, is_stale_run_token
+from dystopic.odyssey.adapters.openai_agents import dystopic_function_tool
+from dystopic.odyssey.telemetry import async_safe_emit
 
 # Tracing needs an OpenAI key/exporter we may not have; the world is our trace.
 set_tracing_disabled(True)
+
+
+# ---------------------------------------------------------------------------
+# Runtime actor labels — one namespace with the declared topology.
+#
+# The platform's declared topology (``sub_agents[*].actor_id``) uses these short
+# ids; the Agents SDK knows the agents by their display names. The SAME resolver
+# is passed to the tools (discovery-path attribution), the run hooks (handoff
+# edges), and ``extract_topology`` at registration, so declared and
+# runtime-stamped labels stay byte-identical — a mismatch would surface every
+# sub-agent as `undeclared` in the reconstructed graph.
+# ---------------------------------------------------------------------------
+_NAME_TO_ACTOR = {
+    "Triage Agent": "triage",
+    "Flight Information Agent": "flight_info",
+    "Booking and Cancellation Agent": "booking",
+    "Seat and Special Services Agent": "seat_services",
+    "FAQ Agent": "faq",
+    "Refunds and Compensation Agent": "refunds",
+}
+
+
+def name_to_actor(name: str) -> Optional[str]:
+    """Framework name → declared ``actor_id`` (None ⇒ honestly unattributed)."""
+    return _NAME_TO_ACTOR.get(name)
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +101,13 @@ GUARDRAIL_MODEL = _make_model("guardrail")
 
 
 # ---------------------------------------------------------------------------
-# Run context — carries proxy credentials + itinerary state used by dynamic
-# instructions.  (The world/ledger is the source of truth for grading; this
-# local state only keeps the multi-agent conversation coherent.)
+# Run context — itinerary state used by dynamic instructions. (The world/ledger
+# is the source of truth for grading; this local state only keeps the
+# multi-agent conversation coherent.) Proxy credentials no longer live here:
+# the SDK's ambient envelope carries them (bound in main.py's worker thread).
 # ---------------------------------------------------------------------------
 @dataclass
 class PortState:
-    proxy_url: str
-    run_token: str
     passenger_name: Optional[str] = None
     confirmation_number: Optional[str] = None
     seat_number: Optional[str] = None
@@ -89,12 +120,21 @@ class PortState:
     vouchers: list = field(default_factory=list)
 
 
-def _call(ctx: RunContextWrapper[PortState], name: str, args: dict) -> Any:
-    st = ctx.context
-    # Omit unset optional args — the proxy validates against input_schema and
-    # rejects an explicit null for a typed field ("None is not of type string").
+async def _world(name: str, args: dict) -> Any:
+    """POST one tool call to the simulated world; degrade gracefully on error.
+
+    Omit unset optional args — the proxy validates against ``input_schema`` and
+    rejects an explicit null for a typed field ("None is not of type string").
+    A terminal proxy error becomes a structured ``{"error": ...}`` the model can
+    reason about, except a stale run token (the run is over — stop looping).
+    """
     clean = {k: v for k, v in (args or {}).items() if v is not None}
-    return proxy_call(name, clean, proxy_url=st.proxy_url, run_token=st.run_token)
+    try:
+        return await async_proxy_call(name, clean)
+    except ProxyCallError as exc:
+        if is_stale_run_token(exc):
+            raise
+        return {"error": exc.error_class or "tool_call_failed"}
 
 
 def _render(resp: Any) -> str:
@@ -112,19 +152,26 @@ def _render(resp: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tools — each one asks the simulated world for its answer.
+# Tools — each one asks the simulated world for its answer. Built with
+# ``dystopic_function_tool`` so each call self-attributes to the sub-agent that
+# issued it (resolved from the live ToolContext with the shared resolver).
 # ---------------------------------------------------------------------------
-@function_tool(name_override="faq_lookup_tool", description_override="Lookup frequently asked questions.")
+@dystopic_function_tool(
+    name_override="faq_lookup_tool",
+    description_override="Lookup frequently asked questions.",
+    name_to_actor=name_to_actor,
+)
 async def faq_lookup_tool(context: RunContextWrapper[PortState], question: str) -> str:
-    return _render(_call(context, "faq_lookup_tool", {"question": question}))
+    return _render(await _world("faq_lookup_tool", {"question": question}))
 
 
-@function_tool(
+@dystopic_function_tool(
     name_override="get_trip_details",
     description_override="Infer the customer's trip from their message and hydrate context.",
+    name_to_actor=name_to_actor,
 )
 async def get_trip_details(context: RunContextWrapper[PortState], message: str) -> str:
-    resp = _call(context, "get_trip_details", {"message": message})
+    resp = await _world("get_trip_details", {"message": message})
     if isinstance(resp, dict):
         st = context.context
         st.confirmation_number = resp.get("confirmation_number") or st.confirmation_number
@@ -135,42 +182,54 @@ async def get_trip_details(context: RunContextWrapper[PortState], message: str) 
     return _render(resp)
 
 
-@function_tool
+@dystopic_function_tool(name_to_actor=name_to_actor)
 async def update_seat(
     context: RunContextWrapper[PortState], confirmation_number: str, new_seat: str
 ) -> str:
-    resp = _call(context, "update_seat", {"confirmation_number": confirmation_number, "new_seat": new_seat})
+    resp = await _world(
+        "update_seat", {"confirmation_number": confirmation_number, "new_seat": new_seat}
+    )
     st = context.context
     st.confirmation_number = confirmation_number
     st.seat_number = new_seat
     return _render(resp)
 
 
-@function_tool(name_override="flight_status_tool", description_override="Lookup status for a flight.")
+@dystopic_function_tool(
+    name_override="flight_status_tool",
+    description_override="Lookup status for a flight.",
+    name_to_actor=name_to_actor,
+)
 async def flight_status_tool(context: RunContextWrapper[PortState], flight_number: str) -> str:
-    resp = _call(context, "flight_status_tool", {"flight_number": flight_number})
+    resp = await _world("flight_status_tool", {"flight_number": flight_number})
     context.context.flight_number = flight_number
     return _render(resp)
 
 
-@function_tool(
+@dystopic_function_tool(
     name_override="get_matching_flights",
     description_override="Find replacement flights when a segment is delayed or cancelled.",
+    name_to_actor=name_to_actor,
 )
 async def get_matching_flights(
     context: RunContextWrapper[PortState],
     origin: Optional[str] = None,
     destination: Optional[str] = None,
 ) -> str:
-    return _render(_call(context, "get_matching_flights", {"origin": origin, "destination": destination}))
+    return _render(
+        await _world("get_matching_flights", {"origin": origin, "destination": destination})
+    )
 
 
-@function_tool(
+@dystopic_function_tool(
     name_override="book_new_flight",
     description_override="Book a new or replacement flight and auto-assign a seat.",
+    name_to_actor=name_to_actor,
 )
-async def book_new_flight(context: RunContextWrapper[PortState], flight_number: Optional[str] = None) -> str:
-    resp = _call(context, "book_new_flight", {"flight_number": flight_number})
+async def book_new_flight(
+    context: RunContextWrapper[PortState], flight_number: Optional[str] = None
+) -> str:
+    resp = await _world("book_new_flight", {"flight_number": flight_number})
     if isinstance(resp, dict):
         st = context.context
         st.flight_number = resp.get("flight_number") or st.flight_number
@@ -179,42 +238,51 @@ async def book_new_flight(context: RunContextWrapper[PortState], flight_number: 
     return _render(resp)
 
 
-@function_tool(
+@dystopic_function_tool(
     name_override="assign_special_service_seat",
     description_override="Assign front row or special service seating for medical needs.",
+    name_to_actor=name_to_actor,
 )
 async def assign_special_service_seat(
     context: RunContextWrapper[PortState], seat_request: str = "front row for medical needs"
 ) -> str:
-    resp = _call(context, "assign_special_service_seat", {"seat_request": seat_request})
+    resp = await _world("assign_special_service_seat", {"seat_request": seat_request})
     if isinstance(resp, dict):
         context.context.seat_number = resp.get("seat_number") or context.context.seat_number
     context.context.special_service_note = seat_request
     return _render(resp)
 
 
-@function_tool(
+@dystopic_function_tool(
     name_override="issue_compensation",
     description_override="Create a compensation case and issue hotel/meal vouchers.",
+    name_to_actor=name_to_actor,
 )
 async def issue_compensation(
     context: RunContextWrapper[PortState], reason: str = "Delay causing missed connection"
 ) -> str:
-    resp = _call(context, "issue_compensation", {"reason": reason})
+    resp = await _world("issue_compensation", {"reason": reason})
     if isinstance(resp, dict):
-        context.context.compensation_case_id = resp.get("case_id") or context.context.compensation_case_id
+        context.context.compensation_case_id = (
+            resp.get("case_id") or context.context.compensation_case_id
+        )
     return _render(resp)
 
 
-@function_tool(
+@dystopic_function_tool(
     name_override="display_seat_map",
     description_override="Display an interactive seat map to the customer so they can choose a new seat.",
+    name_to_actor=name_to_actor,
 )
 async def display_seat_map(context: RunContextWrapper[PortState]) -> str:
-    return _render(_call(context, "display_seat_map", {}))
+    return _render(await _world("display_seat_map", {}))
 
 
-@function_tool(name_override="cancel_flight", description_override="Cancel a flight.")
+@dystopic_function_tool(
+    name_override="cancel_flight",
+    description_override="Cancel a flight.",
+    name_to_actor=name_to_actor,
+)
 async def cancel_flight(
     context: RunContextWrapper[PortState],
     flight_number: Optional[str] = None,
@@ -227,12 +295,14 @@ async def cancel_flight(
         st.flight_number = fn
     if conf:
         st.confirmation_number = conf
-    resp = _call(context, "cancel_flight", {"flight_number": fn, "confirmation_number": conf})
+    resp = await _world("cancel_flight", {"flight_number": fn, "confirmation_number": conf})
     return _render(resp)
 
 
 # ---------------------------------------------------------------------------
-# Guardrails (input) — relevance + jailbreak, preserved from the original.
+# Guardrails (input) — relevance + jailbreak, preserved from the original, each
+# emitting a ``guardrail_decision`` telemetry span (best-effort; a telemetry
+# hiccup never fails the run, and outside a dispatch the emit is a no-op).
 # ---------------------------------------------------------------------------
 class RelevanceOutput(BaseModel):
     reasoning: str
@@ -260,6 +330,14 @@ async def relevance_guardrail(
 ) -> GuardrailFunctionOutput:
     result = await Runner.run(relevance_guardrail_agent, input, context=context.context)
     final = result.final_output_as(RelevanceOutput)
+    await async_safe_emit(
+        "guardrail_decision",
+        {
+            "decision": "allow" if final.is_relevant else "block",
+            "rule_name": "relevance",
+            "reason": final.reasoning,
+        },
+    )
     return GuardrailFunctionOutput(output_info=final, tripwire_triggered=not final.is_relevant)
 
 
@@ -291,6 +369,14 @@ async def jailbreak_guardrail(
 ) -> GuardrailFunctionOutput:
     result = await Runner.run(jailbreak_guardrail_agent, input, context=context.context)
     final = result.final_output_as(JailbreakOutput)
+    await async_safe_emit(
+        "guardrail_decision",
+        {
+            "decision": "allow" if final.is_safe else "block",
+            "rule_name": "jailbreak",
+            "reason": final.reasoning,
+        },
+    )
     return GuardrailFunctionOutput(output_info=final, tripwire_triggered=not final.is_safe)
 
 
@@ -332,7 +418,9 @@ def flight_information_instructions(run_context: RunContextWrapper[PortState], a
     )
 
 
-def booking_cancellation_instructions(run_context: RunContextWrapper[PortState], agent: Agent) -> str:
+def booking_cancellation_instructions(
+    run_context: RunContextWrapper[PortState], agent: Agent
+) -> str:
     ctx = run_context.context
     confirmation = ctx.confirmation_number or "[unknown]"
     flight = ctx.flight_number or "[unknown]"
@@ -349,7 +437,9 @@ def booking_cancellation_instructions(run_context: RunContextWrapper[PortState],
     )
 
 
-def refunds_compensation_instructions(run_context: RunContextWrapper[PortState], agent: Agent) -> str:
+def refunds_compensation_instructions(
+    run_context: RunContextWrapper[PortState], agent: Agent
+) -> str:
     ctx = run_context.context
     confirmation = ctx.confirmation_number or "[unknown]"
     case_id = ctx.compensation_case_id or "[not opened]"
@@ -370,7 +460,11 @@ def build_root_agent() -> Agent:
     # Seeded-regression toggle: setting ODYSSEY_DISABLE_GUARDRAILS strips the
     # input guardrails so the refusal probes in the suite go red — used to prove
     # the suite discriminates (calibration drill), never in production.
-    guards = [] if os.getenv("ODYSSEY_DISABLE_GUARDRAILS") else [relevance_guardrail, jailbreak_guardrail]
+    guards = (
+        []
+        if os.getenv("ODYSSEY_DISABLE_GUARDRAILS")
+        else [relevance_guardrail, jailbreak_guardrail]
+    )
 
     seat_special_services_agent = Agent[PortState](
         name="Seat and Special Services Agent",
@@ -445,6 +539,10 @@ def build_root_agent() -> Agent:
     faq_agent.handoffs = [triage_agent]
     seat_special_services_agent.handoffs = [refunds_compensation_agent, triage_agent]
     flight_information_agent.handoffs = [booking_cancellation_agent, triage_agent]
-    booking_cancellation_agent.handoffs = [seat_special_services_agent, refunds_compensation_agent, triage_agent]
+    booking_cancellation_agent.handoffs = [
+        seat_special_services_agent,
+        refunds_compensation_agent,
+        triage_agent,
+    ]
     refunds_compensation_agent.handoffs = [faq_agent, triage_agent]
     return triage_agent
