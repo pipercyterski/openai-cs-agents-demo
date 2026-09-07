@@ -24,19 +24,50 @@ concurrency:
 jobs:
   regression:
     runs-on: ubuntu-latest
+    env:
+      # Staging control plane. The BuildPipelines/pipelines-regression-action
+      # marketplace action is not published yet, so this job inlines what the
+      # action does: install the CLI and call `odyssey ci review`. The platform
+      # resolves the execution recipe, gate, and bound CI suite from the
+      # connected umbrella agent — nothing else is configured here.
+      DYSTOPIC_BASE_URL: https://api-staging.dystopic.ai
+      DYSTOPIC_API_KEY: ${{ secrets.DYSTOPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # Both the PR's merge-base and head commits must be present.
+          # Both the PR's merge-base and head commits must be present locally so
+          # the merge-base can be derived (stable per PR across base churn).
           fetch-depth: 0
-      - uses: BuildPipelines/pipelines-regression-action@v1
+
+      - uses: actions/setup-python@v5
         with:
-          api-key: ${{ secrets.DYSTOPIC_API_KEY }}
-          # Nothing else is configured here. The platform sources the agent's
-          # bound CI suite's frozen scenarios and resolves the run recipe
-          # (command, tools, credentials) from this repo's connected umbrella
-          # agent — there is no local project file to read.
-          #
-          # Optional: name a specific platform suite. Defaults to the agent's
-          # bound CI suite (`dystopic agents ci-suite set`), else "default".
-          # suite: my-suite
+          python-version: "3.12"
+
+      - name: Install Dystopic CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install "dystopic[cli,odyssey]==0.22.0"
+          odyssey ci review --help >/dev/null
+
+      - name: Derive merge-base
+        id: mb
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          MB="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          echo "merge_base=$MB" >> "$GITHUB_OUTPUT"
+          echo "Derived merge-base $MB (base tip $BASE_SHA, head $HEAD_SHA)"
+
+      - name: Dystopic CI review
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Exit 1 => gate blocked (red), 0 => pass/neutral/advisory, 2 => usage.
+          # The platform posts the branded check + sticky report asynchronously;
+          # this job's own status is what branch protection should require.
+          odyssey ci review \
+            --repo "${{ github.repository }}" \
+            --base "${{ steps.mb.outputs.merge_base }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --pr-number "$PR_NUMBER"
