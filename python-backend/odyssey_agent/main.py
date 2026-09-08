@@ -36,9 +36,16 @@ from agents import InputGuardrailTripwireTriggered, RunHooks, Runner
 from agents.exceptions import MaxTurnsExceeded
 
 from dystopic.odyssey import Envelope
-from dystopic.odyssey.adapters.openai_agents import actor_label_for, bind_current_actor
+from dystopic.odyssey.adapters.openai_agents import (
+    actor_label_for,
+    bind_current_actor,
+    replay_to_input_items,
+)
 from dystopic.odyssey.context import set_current
-from dystopic.odyssey.telemetry import async_safe_emit
+from dystopic.odyssey.telemetry import (
+    async_safe_emit_handoff_traversal,
+    async_safe_emit_state_snapshot,
+)
 from dystopic.odyssey.traces import async_safe_post_handoff
 
 from airline import PortState, build_root_agent, name_to_actor
@@ -66,17 +73,16 @@ class _DemoRunHooks(RunHooks):
             return
         # Native trace edge — the graded/observed lane.
         await async_safe_post_handoff(frm, to)
-        # Telemetry span — the display-side rationale lane.
-        await async_safe_emit(
-            "handoff_traversal",
-            {
-                "from_sub_agent": frm,
-                "to_sub_agent": to,
-                "reason": (
-                    f"{getattr(from_agent, 'name', frm)} transferred control to "
-                    f"{getattr(to_agent, 'name', to)} (OpenAI Agents SDK handoff)"
-                ),
-            },
+        # Telemetry span — the display-side rationale lane (SDK ≥ 0.23 typed
+        # helper; the platform's display graph dedupes this twin against the
+        # native edge above, so emitting both is free).
+        await async_safe_emit_handoff_traversal(
+            frm,
+            to,
+            reason=(
+                f"{getattr(from_agent, 'name', frm)} transferred control to "
+                f"{getattr(to_agent, 'name', to)} (OpenAI Agents SDK handoff)"
+            ),
         )
 
 
@@ -104,46 +110,22 @@ def run_async_in_thread(coro_factory, envelope: Envelope):
     return out["result"]
 
 
-def _replay_to_input_items(rows: list) -> list:
-    """Convert a platform-replayed wire transcript into Agents SDK input items.
-
-    Under ``memory_mode: replay`` the platform hands back the *wire-contract*
-    transcript: flat rows that may carry ``tool_calls``, ``role: tool`` results,
-    or ``content: null``. The OpenAI Responses API rejects those shapes verbatim
-    (400 ``Invalid type for 'input[N].content' ... got null``), so keep the
-    conversational spine — user/assistant/system rows with real text — and drop
-    prior-turn tool plumbing (the assistant's own text already narrates it).
-    """
-    items = []
-    for m in rows:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role")
-        content = m.get("content")
-        if isinstance(content, list):
-            texts = [
-                p.get("text")
-                for p in content
-                if isinstance(p, dict) and isinstance(p.get("text"), str)
-            ]
-            content = "\n".join(t for t in texts if t)
-        if role in ("user", "assistant", "system") and isinstance(content, str) and content.strip():
-            items.append({"role": role, "content": content})
-    return items
-
-
 def _instruction_from(task_input: dict) -> Any:
     """Extract the agent input from the scenario payload.
 
     Supports single-shot (``user_instruction``) and replayed multi-turn
-    transcripts (``messages`` / ``input_items``).
+    transcripts (``messages`` / ``input_items``). The SDK's
+    ``replay_to_input_items`` (≥ 0.23) converts a platform-replayed
+    wire-contract transcript (flat ``tool_calls`` rows, ``role: tool``,
+    ``content: null``) into Responses-valid input items — passing the raw
+    replay verbatim 400s the API.
     """
     if not isinstance(task_input, dict):
         return str(task_input)
     for key in ("messages", "input_items", "conversation"):
         val = task_input.get(key)
         if isinstance(val, list) and val:
-            items = _replay_to_input_items(val)
+            items = replay_to_input_items(val)
             if items:
                 return items
     return task_input.get("user_instruction") or json.dumps(task_input)
@@ -233,9 +215,7 @@ def run(task_input: dict, *, proxy_url: str, run_token: str) -> dict:
             "special_service_note": state.special_service_note,
         }
         if any(v for v in snapshot.values()):
-            await async_safe_emit(
-                "state_snapshot", {"snapshot": snapshot, "label": "final-itinerary"}
-            )
+            await async_safe_emit_state_snapshot(snapshot, label="final-itinerary")
         return result
 
     try:

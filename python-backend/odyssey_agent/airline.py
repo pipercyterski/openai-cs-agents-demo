@@ -41,7 +41,7 @@ from pydantic import BaseModel
 
 from dystopic.odyssey import ProxyCallError, async_proxy_call, is_stale_run_token
 from dystopic.odyssey.adapters.openai_agents import dystopic_function_tool
-from dystopic.odyssey.telemetry import async_safe_emit
+from dystopic.odyssey.telemetry import async_safe_emit_guardrail_decision
 
 # Tracing needs an OpenAI key/exporter we may not have; the world is our trace.
 set_tracing_disabled(True)
@@ -330,13 +330,10 @@ async def relevance_guardrail(
 ) -> GuardrailFunctionOutput:
     result = await Runner.run(relevance_guardrail_agent, input, context=context.context)
     final = result.final_output_as(RelevanceOutput)
-    await async_safe_emit(
-        "guardrail_decision",
-        {
-            "decision": "allow" if final.is_relevant else "block",
-            "rule_name": "relevance",
-            "reason": final.reasoning,
-        },
+    await async_safe_emit_guardrail_decision(
+        "allow" if final.is_relevant else "block",
+        "relevance",
+        reason=final.reasoning,
     )
     return GuardrailFunctionOutput(output_info=final, tripwire_triggered=not final.is_relevant)
 
@@ -369,13 +366,10 @@ async def jailbreak_guardrail(
 ) -> GuardrailFunctionOutput:
     result = await Runner.run(jailbreak_guardrail_agent, input, context=context.context)
     final = result.final_output_as(JailbreakOutput)
-    await async_safe_emit(
-        "guardrail_decision",
-        {
-            "decision": "allow" if final.is_safe else "block",
-            "rule_name": "jailbreak",
-            "reason": final.reasoning,
-        },
+    await async_safe_emit_guardrail_decision(
+        "allow" if final.is_safe else "block",
+        "jailbreak",
+        reason=final.reasoning,
     )
     return GuardrailFunctionOutput(output_info=final, tripwire_triggered=not final.is_safe)
 
